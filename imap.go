@@ -9,9 +9,12 @@ import (
   "postoffice/postbox"
   "path"
   go_imap "github.com/sbinet/go-imap/go1/imap"
+  "time"
 )
 
 // SERVER ---------------------------------------------------------------------
+
+const HIERARCHY_DELIMITER = "/"
 
 type Server struct {
   debug bool
@@ -109,8 +112,8 @@ func (e CommandNotFoundError) Error() string {
 
 func handle_session(sess *Session) error {
   // TODO: Timeouts
-  // timeout := time.Duration(10) * time.Second;
-  // sess.conn.SetReadDeadline(time.Now().Add(timeout))
+  timeout := time.Duration(30) * time.Minute;
+  sess.conn.SetReadDeadline(time.Now().Add(timeout))
   
   if sess.server.IsDebug() { fmt.Printf("OPENED %p\n", sess) }
   
@@ -163,23 +166,15 @@ command:
     case "SELECT":
       e = sess.SELECT(command)
     case "LSUB":
-      e = nil
-      sess.Sendf("%s OK LSUB\r\n", command.Tag)
+      e = sess.LSUB(command)
     case "LIST":
-      e = nil
-      parts := strings.SplitN(command.Arguments, " ", 2)
-      // ref_name := parts[0]
-      mailbox := parts[1]
-      if mailbox == "INBOX" || mailbox == "\"INBOX\"" {
-        sess.Sendf("* LIST () \"/\" \"INBOX\"\r\n")
-        sess.Sendf("%s OK LIST\r\n", command.Tag)
-      } else {
-        sess.Sendf("%s NO\r\n", command.Tag);
-      }
+      e = sess.LIST(command)
     case "CLOSE":
       // TODO: \Deleted message cleanup and such
       sess.Sendf("%s OK CLOSING\r\n", command.Tag)
       goto close
+    case "CREATE":
+      e = sess.CREATE(command)
     }//switch Command
   }
   
@@ -197,17 +192,44 @@ command:
   // fmt.Printf("command: %v\n", command)
   
 close:
-  if sess.postbox != nil { sess.postbox.Close() }
   sess.conn.Close()
   if sess.server.IsDebug() { fmt.Printf("CLOSED %p\n\n", sess) }
   return nil
   
 err:
-  if sess.postbox != nil { sess.postbox.Close() }
   sess.conn.Close()
   return fmt.Errorf("handle_session: %v", e)
 }
 
+func (sess *Session) LSUB(comm *Command) error {
+  mbs, err := sess.postbox.GetMailboxes()
+  if err != nil { return err }
+  for _, mb := range mbs {
+    // fmt.Printf("mb: %+v\n", mb)
+    sess.Sendf(
+      "* LIST () \"%s\" %s\r\n",
+      HIERARCHY_DELIMITER, go_imap.Quote(mb.Name, false),
+    )
+  }
+  sess.Sendf("%s OK LSUB\r\n", comm.Tag)
+  return nil
+}
+
+func (sess *Session) CREATE(comm *Command) error {
+  mailbox := unquote(strings.TrimSpace(comm.Arguments))
+  if strings.ToUpper(mailbox) == "INBOX" {
+    sess.Sendf("%s NO Can't CREATE an INBOX\r\n", comm.Tag)
+    return nil
+  }
+  mb, e := sess.postbox.NewMailbox(mailbox)
+  if e != nil {
+    sess.Sendf("%s NO Failed to create mailbox\r\n", comm.Tag)
+    return e
+  } else {
+    sess.Sendf("%s OK Created mailbox '%s'\r\n", comm.Tag, mb.Name)
+  }
+  return nil
+}
 func (sess *Session) SELECT(comm *Command) error {
   mailbox := strings.TrimSpace(comm.Arguments)
   mailbox = unquote(mailbox)
@@ -221,6 +243,32 @@ func (sess *Session) SELECT(comm *Command) error {
   if err != nil { panic(err) }
   sess.Sendf("* OK [UIDNEXT %s] Next UID\r\n", uid)
   sess.Sendf("%s OK [READ_WRITE] SELECT\r\n", comm.Tag)
+  return nil
+}
+func (sess *Session) LIST(comm *Command) error {
+  parts := strings.SplitN(comm.Arguments, " ", 2)
+  ref_name := parts[0]
+  if ref_name != "\"\"" {
+    sess.Sendf("%s BAD Reference names not allowed\r\n")
+    return nil
+  }
+  mailbox := unquote(strings.TrimSpace(parts[1]))
+  if strings.ToUpper(mailbox) == "INBOX" {
+    sess.Sendf("* LIST () \"%s\" \"INBOX\"\r\n", HIERARCHY_DELIMITER)
+    sess.Sendf("%s OK LIST\r\n", comm.Tag)
+  } else {
+    mb, err := sess.postbox.GetMailbox(mailbox)
+    if err != nil { return err }
+    if mb != nil {
+      sess.Sendf(
+        "* LIST () \"%s\" %s\r\n",
+        HIERARCHY_DELIMITER, go_imap.Quote(mb.Name, false),
+      )
+      sess.Sendf("%s OK LIST\r\n", comm.Tag)
+    } else {
+      sess.Sendf("%s NO\r\n", comm.Tag);
+    }
+  }
   return nil
 }
 
@@ -239,15 +287,19 @@ func (sess *Session) LOGIN(comm *Command) error {
   if pair == nil || len(pair) != 2 {
     return fmt.Errorf("Invalid LOGIN arguments: %q", comm.Arguments)
   }
-  user, _ := go_imap.Unquote(pair[0])
+  user := unquote(pair[0])
   // pass := pair[1]
   // TODO: User authentication
   
   sess.username = user
   // TODO: Fix paths
-  sess.postbox = postbox.OpenPostbox(
-    path.Join("/dirk/projects/courier/test", sess.username),
-  )
+  if sess.postbox == nil {
+    // TODO: Make this maybe close postboxes
+    sess.postbox = postbox.GetPostbox(
+      path.Join("/dirk/projects/courier/test", sess.username),
+    )
+  }
+  
   
   sess.state = AUTHENTICATED
   sess.Sendf("%s OK LOGIN\r\n", comm.Tag)
