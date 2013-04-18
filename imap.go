@@ -6,21 +6,26 @@ import (
   "net"
   "strings"
   // "time"
-  "postoffice/postbox"
-  "path"
-  go_imap "github.com/sbinet/go-imap/go1/imap"
+  go1_imap "github.com/sbinet/go-imap/go1/imap"
   "time"
+  "os"
+  "strconv"
+  "imap/intf"
 )
 
 // SERVER ---------------------------------------------------------------------
 
 const HIERARCHY_DELIMITER = "/"
 
+type LoginProvider func(*Session, string, string) error
+
 type Server struct {
   debug bool
   addr string
   hostname string
   listener net.Listener
+  closed bool
+  Login LoginProvider
 }
 func (server *Server) IsDebug() bool {
   return server.debug
@@ -28,8 +33,13 @@ func (server *Server) IsDebug() bool {
 func (server *Server) SetDebug(d bool) {
   server.debug = d
 }
-func NewServer(hostname string, addr string) *Server {
-  server := &Server{false, addr, hostname, nil}
+func (server *Server) Closed() bool { return server.closed }
+func (server *Server) Close() {
+  server.closed = true
+  server.listener.Close()
+}
+func NewServer(hostname string, addr string, login_provider LoginProvider) *Server {
+  server := &Server{false, addr, hostname, nil, false, login_provider}
   return server
 }
 
@@ -48,14 +58,15 @@ type Session struct {
   // Stateful stuff
   state int
   username string
-  postbox  *postbox.Postbox
-  mailbox string
+  postbox string // Name of the postbox for this session
+  mailbox string // Name of the mailbox
+  storage intf.Storage // Storage system
 }
 func NewSession(
   server *Server, conn net.Conn,
   reader *bufio.Reader, writer *bufio.Writer,
 ) *Session {
-  s := &Session{server, conn, reader, writer, NOT_AUTHENTICATED, "", nil, ""}
+  s := &Session{server, conn, reader, writer, NOT_AUTHENTICATED, "", "", "", nil}
   return s
 }
 func (sess *Session) Sendf(format string, args ...interface{}) {
@@ -65,6 +76,15 @@ func (sess *Session) Sendf(format string, args ...interface{}) {
 func (sess *Session) Readline() (string, error) {
   s, e := sess.reader.ReadString('\n')
   return s, e
+}
+func (sess *Session) Storage() intf.Storage {
+  return sess.storage
+}
+func (sess *Session) SetStorage(storage intf.Storage) {
+  sess.storage = storage
+}
+func (sess *Session) SetUsername(username string) {
+  sess.username = username
 }
 
 // COMMAND --------------------------------------------------------------------
@@ -175,6 +195,12 @@ command:
       goto close
     case "CREATE":
       e = sess.CREATE(command)
+    case "UID":
+      e = sess.UID(command)
+    case "STATUS":
+      e = sess.STATUS(command)
+    case "FETCH":
+      e = sess.FETCH(command)
     }//switch Command
   }
   
@@ -201,14 +227,95 @@ err:
   return fmt.Errorf("handle_session: %v", e)
 }
 
+
+
+func (sess *Session) UID(comm *Command) error {
+  parts := strings.SplitN(comm.Arguments, " ", 2)
+  if len(parts) != 2 {
+    sess.Sendf("%s BAD Invalid command: %s\r\n", comm.Tag, comm.Command)
+    return nil
+  }
+  subcommand := strings.ToUpper(parts[0])
+  subargs    := parts[1]
+  if subcommand == "FETCH" {
+    return sess.UID_FETCH(comm, subargs)
+  } else {
+    sess.Sendf("%s BAD Invalid command: %s\r\n", comm.Tag, comm.Command)
+    return nil
+  }
+  return nil
+}
+func (sess *Session) UID_FETCH(comm *Command, args string) error {
+  fmt.Printf("args: %#v\n", args)
+  
+  parts := strings.SplitN(args, " ", 2)
+  if len(parts) != 2 {
+    sess.Sendf("%s BAD Invalid arguments: %s\r\n", comm.Tag, args)
+    return nil
+  }
+  
+  seq   := parts[0]
+  // items := parts[1]
+  
+  msgs, err := FindUIDSequence(sess, comm, seq)
+  if err != nil {
+    sess.Sendf("%s NO Error fetching\r\n", comm.Tag)
+    fmt.Fprintf(os.Stderr, "ERROR UID FETCH(%q): %v\n", comm.Arguments, err)
+    return nil
+  }
+  
+  
+  if strings.Contains(args, "FLAGS") {
+    for _, msg := range msgs {
+      sess.Sendf("* %s FETCH (FLAGS ())\r\n", msg.UID())
+    }
+    sess.Sendf("%s OK FETCH\r\n", comm.Tag)
+  }
+  
+  sess.Sendf("%s BAD Not implemented\r\n", comm.Tag)
+  return nil
+}
+func FindUIDSequence(sess *Session, comm *Command, seq string) ([]intf.Message, error) {
+  if sess.mailbox == "" {
+    sess.Sendf("%s NO No mailbox SELECT'ed\r\n", comm.Tag, seq)
+    return nil, fmt.Errorf("ERROR UID FETCH(%q): %v", comm.Arguments, "No mailbox")
+  }
+  if strings.Contains(seq, ":") {
+    parts := strings.SplitN(seq, ":", 2)
+    if len(parts) != 2 {
+      sess.Sendf("%s BAD Invalid sequence: %s\r\n", comm.Tag, seq)
+      return nil, fmt.Errorf("Invalid sequence: %q", seq)
+    }
+    start_uid := parts[0]
+    end_uid   := parts[1]
+    if end_uid == "*" {
+      return sess.Storage().MailboxFindMessagesAfterUID(sess.mailbox, start_uid)
+    } else {
+      fmt.Printf("FindMessagesFromTo not implemented\n")
+      return sess.Storage().MailboxFindMessagesFromToUID(sess.mailbox, start_uid, end_uid)
+    }
+  } else {
+    if seq == "*" {
+      fmt.Printf("FindAllMessages not implemented\n")
+      return sess.Storage().MailboxFindAllMessages(sess.mailbox)
+    } else {
+      fmt.Printf("FindMessage not implemented\n")
+      msg, err := sess.Storage().MailboxFindMessageByUID(sess.mailbox, seq)
+      return []intf.Message{msg}, err
+    }
+  }
+  return nil, fmt.Errorf("Unreachable")
+}
+
 func (sess *Session) LSUB(comm *Command) error {
-  mbs, err := sess.postbox.GetMailboxes()
+  mbs, err := sess.Storage().GetMailboxes()
+  // TODO: Parse arguments
   if err != nil { return err }
   for _, mb := range mbs {
     // fmt.Printf("mb: %+v\n", mb)
     sess.Sendf(
       "* LIST () \"%s\" %s\r\n",
-      HIERARCHY_DELIMITER, go_imap.Quote(mb.Name, false),
+      HIERARCHY_DELIMITER, go1_imap.Quote(mb.Name(), false),
     )
   }
   sess.Sendf("%s OK LSUB\r\n", comm.Tag)
@@ -221,28 +328,44 @@ func (sess *Session) CREATE(comm *Command) error {
     sess.Sendf("%s NO Can't CREATE an INBOX\r\n", comm.Tag)
     return nil
   }
-  mb, e := sess.postbox.NewMailbox(mailbox)
+  mb, e := sess.Storage().NewMailbox(mailbox)
   if e != nil {
     sess.Sendf("%s NO Failed to create mailbox\r\n", comm.Tag)
     return e
   } else {
-    sess.Sendf("%s OK Created mailbox '%s'\r\n", comm.Tag, mb.Name)
+    sess.Sendf("%s OK Created mailbox '%s'\r\n", comm.Tag, mb.Name())
   }
   return nil
 }
+
+const SYSTEM_FLAGS = "\\Seen \\Answered \\Flagged \\Deleted \\Draft \\Recent"
+
 func (sess *Session) SELECT(comm *Command) error {
-  mailbox := strings.TrimSpace(comm.Arguments)
-  mailbox = unquote(mailbox)
-  // if ok != true { return fmt.Errorf("Error SELECTing mailbox %q", mailbox) }
+  // Reset first (according to RFC)
+  sess.mailbox = ""
+  // Filter the parameter
+  m_name := strings.TrimSpace(comm.Arguments)
+  m_name = unquote(m_name)
   
-  fmt.Printf("SELECT: %q\n", mailbox)
-  sess.Sendf("* FLAGS ()\r\n")
-  sess.Sendf("* 0 EXISTS\r\n")
+  // Look up the mailbox
+  _, err := sess.Storage().GetMailbox(m_name)
+  if err != nil {
+    fmt.Fprintf(os.Stderr, "SELECT(%s) Error: %v", m_name, err)
+    sess.Sendf("%s BAD Could not open mailbox\r\n")
+    return nil
+  }
+  sess.mailbox = m_name
+  
+  fmt.Printf("SELECT(%s) Success\n", m_name)
+  sess.Sendf("* FLAGS (%s)\r\n", SYSTEM_FLAGS)
+  sess.Sendf("* 1 EXISTS\r\n")
   sess.Sendf("* 0 RECENT\r\n")
-  uid, err := sess.postbox.GetUID()
+  // sess.Sendf("* OK [UNSEEN 0]\r\n") // FIXME: Naughty
+  uid, err := sess.Storage().GetUID()
   if err != nil { panic(err) }
   sess.Sendf("* OK [UIDNEXT %s] Next UID\r\n", uid)
-  sess.Sendf("%s OK [READ_WRITE] SELECT\r\n", comm.Tag)
+  sess.Sendf("* OK [UIDVALIDITY 0] Next UID\r\n")
+  sess.Sendf("%s OK [READ-WRITE] SELECT\r\n", comm.Tag)
   return nil
 }
 func (sess *Session) LIST(comm *Command) error {
@@ -253,16 +376,24 @@ func (sess *Session) LIST(comm *Command) error {
     return nil
   }
   mailbox := unquote(strings.TrimSpace(parts[1]))
-  if strings.ToUpper(mailbox) == "INBOX" {
+  if mailbox == "*" {
+    var mbs []intf.Mailbox
+    mbs, err := sess.Storage().GetMailboxes()
+    if err != nil { return err }
+    for _, mb := range mbs {
+      sess.Sendf("* LIST () \"%s\" %s\r\n", HIERARCHY_DELIMITER, quote(mb.Name()))
+    }
+    sess.Sendf("%s OK LIST\r\n", comm.Tag)
+  } else if strings.ToUpper(mailbox) == "INBOX" {
     sess.Sendf("* LIST () \"%s\" \"INBOX\"\r\n", HIERARCHY_DELIMITER)
     sess.Sendf("%s OK LIST\r\n", comm.Tag)
   } else {
-    mb, err := sess.postbox.GetMailbox(mailbox)
+    mb, err := sess.Storage().GetMailbox(mailbox)
     if err != nil { return err }
     if mb != nil {
       sess.Sendf(
         "* LIST () \"%s\" %s\r\n",
-        HIERARCHY_DELIMITER, go_imap.Quote(mb.Name, false),
+        HIERARCHY_DELIMITER, go1_imap.Quote(mb.Name(), false),
       )
       sess.Sendf("%s OK LIST\r\n", comm.Tag)
     } else {
@@ -272,14 +403,56 @@ func (sess *Session) LIST(comm *Command) error {
   return nil
 }
 
-func unquote(s string) string {
-  if go_imap.Quoted(s) {
-    r, ok := go_imap.Unquote(s)
-    if ok {
-      return r
-    } else { return s }
+func (sess *Session) STATUS(comm *Command) error {
+  parts := strings.SplitN(comm.Arguments, " ", 2)
+  m_name  := unquote(parts[0])
+  p_items := parts[1]
+  
+  mb, err := sess.Storage().GetMailbox(m_name)
+  if err != nil {
+    fmt.Fprintf(os.Stderr, "ERROR: STATUS(%s) %v\n", m_name, err)
+    sess.Sendf("%s NO Mailbox doesn't exist\r\n", comm.Tag)
+    return err
   }
-  return s
+  
+  pairs := make([]string, 0)
+  messages := (strings.Contains(p_items, "MESSAGES"))
+  recent   := (strings.Contains(p_items, "RECENT"))
+  uidnext  := (strings.Contains(p_items, "UIDNEXT"))
+  uidvalidity := (strings.Contains(p_items, "UIDVALIDITY"))
+  unseen   := (strings.Contains(p_items, "UNSEEN"))
+  
+  if messages {
+    count, err := sess.Storage().MailboxCountAllMessages(mb.Name())
+    if err != nil {
+      fmt.Fprintf(os.Stderr, "ERROR: STATUS(%s) MESSAGES: %v\n", m_name, err)
+    } else {
+      pairs = append(pairs, "MESSAGES "+strconv.Itoa(count))
+    }
+  }
+  if recent {
+    // FIXME: Make this work
+    pairs = append(pairs, "RECENT 0")
+  }
+  if uidnext {
+    uid, err := sess.Storage().NextUID()
+    if err != nil {
+      fmt.Fprintf(os.Stderr, "ERROR: STATUS(%s) MESSAGES: %v\n", m_name, err)
+    } else {
+      pairs = append(pairs, "UIDNEXT "+uid)
+    }
+  }
+  if uidvalidity {
+    // FIXME: Make this work
+    pairs = append(pairs, "UIDVALIDITY 0")
+  }
+  if unseen {
+    // FIXME: Make this work
+    pairs = append(pairs, "UNSEEN 0")
+  }
+  sess.Sendf("* STATUS %s (%s)\r\n", quote(mb.Name()), strings.Join(pairs, " "))
+  sess.Sendf("%s OK STATUS\r\n", comm.Tag)
+  return nil
 }
 
 func (sess *Session) LOGIN(comm *Command) error {
@@ -288,24 +461,25 @@ func (sess *Session) LOGIN(comm *Command) error {
     return fmt.Errorf("Invalid LOGIN arguments: %q", comm.Arguments)
   }
   user := unquote(pair[0])
-  // pass := pair[1]
-  // TODO: User authentication
+  pass := pair[1]
   
-  sess.username = user
-  // TODO: Fix paths
-  if sess.postbox == nil {
-    // TODO: Make this maybe close postboxes
-    sess.postbox = postbox.GetPostbox(
-      path.Join("/dirk/projects/courier/test", sess.username),
-    )
+  // TODO: User authentication
+  err := sess.server.Login(sess, user, pass)
+  if err != nil { return err }
+  
+  if sess.username != "" {
+    sess.username = user
+    sess.state = AUTHENTICATED
+    sess.Sendf("%s OK LOGIN\r\n", comm.Tag)
+    fmt.Printf("Logged in: %q\n", user)
+  } else {
+    return fmt.Errorf("ERROR LOGIN\n")
   }
   
-  
-  sess.state = AUTHENTICATED
-  sess.Sendf("%s OK LOGIN\r\n", comm.Tag)
-  fmt.Printf("Logged in: %q\n", user)
   return nil
 }
+
+// SERVER ---------------------------------------------------------------------
 
 func Listen(server *Server) (error) {
   ln, e := net.Listen("tcp", server.addr)
@@ -321,6 +495,9 @@ func Serve(server *Server) error {
   for {
     conn, e := server.listener.Accept()
     if e != nil {
+      if server.Closed() {
+        break
+      }
       fmt.Printf("accept error: %v\n", e)
       return e
     }
@@ -342,3 +519,5 @@ func Serve(server *Server) error {
   
   return nil
 }
+
+
