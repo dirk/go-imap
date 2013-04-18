@@ -3,19 +3,38 @@ package intf
 import (
   SMTP "smtp"
   "time"
+  "fmt"
 )
+
+// ERRORS ---------------------------------------------------------------------
+
+type MailboxNotFound struct {
+  name string
+  message string
+}
+func (mnf MailboxNotFound) Error() string {
+  if mnf.message == "" {
+    return fmt.Sprintf("Mailbox %q not found", mnf.name)
+  }
+  return fmt.Sprintf("Mailbox %q not found: %s", mnf.name, mnf.message)
+}
+func NewMailboxNotFound(name, message string) MailboxNotFound {
+  return MailboxNotFound{name, message}
+}
+
+// INTERFACES -----------------------------------------------------------------
 
 type Mailbox interface {
   Name() string
 }
 type Message interface {
-  UID()        string
-  Flags()      []string
-  From()       *SMTP.Address
-  Date()       time.Time
-  Size()       uint32
-  HeaderSize() uint32
-  BodySize()   uint32
+  GetUID()        string
+  GetFlags()      []string
+  GetFrom()       *SMTP.Address
+  GetDate()       time.Time
+  GetSize()       uint32
+  GetHeaderSize() uint32
+  GetBodySize()   uint32
 }
 type Envelope interface {
   From() *SMTP.Address
